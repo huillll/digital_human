@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path("/home/test/CyberVerse/demo_outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# 克隆声音参考音频存放目录
+CLONED_VOICES_DIR = Path("/home/test/CyberVerse/cloned_voices")
+CLONED_VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
 LM_STUDIO_URL   = "http://192.168.1.101:1234/v1"
 LM_STUDIO_MODEL = "holo-3.1-35b-a3b"
@@ -67,6 +71,10 @@ _current_avatar: str = DEFAULT_AVATAR
 _plugin_lock = threading.Lock()
 
 WHISPER_MODEL = "/home/test/money_printer_turbo/MoneyPrinterTurbo/models/whisper-large-v3"
+VOXCPM_MODEL  = "openbmb/VoxCPM2"   # HuggingFace model id
+
+_voxcpm_model = None
+_voxcpm_lock  = threading.Lock()
 
 
 def _load_whisper():
@@ -78,6 +86,21 @@ def _load_whisper():
     _whisper_pipeline = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     logger.info("Whisper 加载完成")
     return _whisper_pipeline
+
+
+def _load_voxcpm():
+    """懒加载 VoxCPM2，线程安全。需要 GPU (~8GB VRAM)。"""
+    global _voxcpm_model
+    if _voxcpm_model is not None:
+        return _voxcpm_model
+    with _voxcpm_lock:
+        if _voxcpm_model is not None:
+            return _voxcpm_model
+        from voxcpm import VoxCPM
+        logger.info("加载 VoxCPM2 声音克隆模型…")
+        _voxcpm_model = VoxCPM.from_pretrained(VOXCPM_MODEL, load_denoiser=False)
+        logger.info("VoxCPM2 加载完成")
+    return _voxcpm_model
 
 
 async def _init_flash_head(avatar_path: str):
@@ -132,6 +155,41 @@ def _ensure_flash_head(avatar_path: str | None = None):
         elif target != _current_avatar:
             _run(_flash_plugin.set_avatar(target, use_face_crop=False))
             _current_avatar = target
+
+
+# ─── URL 文章抓取 & 摘要 ──────────────────────────────────────────────────────
+_MPT_PATH = "/home/test/money_printer_turbo/MoneyPrinterTurbo"
+
+_SUMMARIZE_PROMPT = """\
+你是短视频文案创作者。根据下面的文章，写一段适合数字人播报的口播文案。
+
+要求：
+- 200~300字，口语化，有观点，有共鸣感
+- 不要说"本文"、"文章"、"作者"等字眼
+- 结尾可加一句互动引导
+- 只输出文案本身，不要任何解释
+
+文章标题：{title}
+
+文章内容：
+{content}"""
+
+
+def fetch_and_summarize(url: str) -> tuple[str, str]:
+    """抓取公众号/普通文章 URL，LLM 生成摘要，返回 (摘要, 状态)。"""
+    if _MPT_PATH not in sys.path:
+        sys.path.insert(0, _MPT_PATH)
+    from app.utils.wechat_article import fetch_article
+
+    article = fetch_article(url)
+    title   = article.get("title", "")
+    content = article.get("content", "")
+    logger.info("抓取文章: %s (%d 字)", title, len(content))
+
+    prompt = _SUMMARIZE_PROMPT.format(title=title, content=content[:3000])
+    summary = call_llm([{"role": "user", "content": prompt}])
+    status  = f"✅ {title}（原文 {len(content)} 字 → 摘要 {len(summary)} 字）"
+    return summary, status
 
 
 # ─── ASR ─────────────────────────────────────────────────────────────────────
@@ -215,6 +273,80 @@ def call_llm(messages: list[dict]) -> str:
     return text
 
 
+# ─── 声音克隆工具 (VoxCPM) ───────────────────────────────────────────────────
+CLONED_VOICE_PREFIX = "CLONED:"
+
+
+def extract_reference_audio(media_path: str, out_dir: Path = CLONED_VOICES_DIR) -> str:
+    """从视频或音频文件中提取 16kHz 单声道 WAV，用作克隆参考音频。"""
+    stem = Path(media_path).stem
+    out_wav = str(out_dir / f"{stem}_ref.wav")
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", media_path,
+         "-vn",                          # 去掉视频轨
+         "-ar", "16000", "-ac", "1",     # 16kHz mono
+         "-t", "30",                     # 最多取前 30 秒（克隆不需要太长）
+         out_wav],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            "提取音频失败: " + r.stderr.decode("utf-8", errors="replace").strip()
+        )
+    size = os.path.getsize(out_wav)
+    if size < 8000:
+        raise RuntimeError(f"提取的音频过短或为空 ({size} bytes)")
+    logger.info("参考音频已保存: %s (%.1f KB)", out_wav, size / 1024)
+    return out_wav
+
+
+def voxcpm_synthesize(text: str, reference_wav: str) -> str:
+    """VoxCPM 声音克隆 TTS：参考音频 → 克隆音色合成，返回 16kHz WAV 路径。
+
+    注意：VoxCPM2 需要约 8GB GPU VRAM。
+    输出 48kHz → ffmpeg 重采样到 16kHz 供 FlashHead 使用。
+    """
+    import soundfile as sf
+    model = _load_voxcpm()
+    logger.info("VoxCPM 合成: %d 字，参考音频: %s", len(text), reference_wav)
+    wav_48k = model.generate(
+        text=text,
+        reference_wav_path=reference_wav,
+        cfg_value=2.0,
+        inference_timesteps=10,
+    )
+    # 先存 48kHz WAV
+    fd48, path_48k = tempfile.mkstemp(suffix=".wav", prefix="cv_vox48_")
+    os.close(fd48)
+    sf.write(path_48k, wav_48k, 48000)
+    # 重采样到 16kHz
+    wav_path = tempfile.mktemp(suffix=".wav", prefix="cv_vox16_")
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", path_48k, "-ar", "16000", "-ac", "1", wav_path],
+        capture_output=True,
+    )
+    try:
+        os.unlink(path_48k)
+    except OSError:
+        pass
+    if r.returncode != 0:
+        raise RuntimeError(
+            "VoxCPM 重采样失败: " + r.stderr.decode("utf-8", errors="replace").strip()
+        )
+    return wav_path
+
+
+def list_cloned_voices() -> list[tuple[str, str]]:
+    """返回已保存的克隆声音列表，格式为 [(显示名, CLONED:path), ...]。"""
+    choices = []
+    for wav in sorted(CLONED_VOICES_DIR.glob("*.wav")):
+        label = wav.stem.replace("_ref", "").replace("_", " ")
+        choices.append((f"克隆: {label}", f"{CLONED_VOICE_PREFIX}{wav}"))
+    return choices
+
+
 # ─── TTS → 16kHz WAV ─────────────────────────────────────────────────────────
 _SENTENCE_SPLIT_RE = None
 
@@ -267,7 +399,14 @@ async def _tts_to_mp3(text: str, mp3_path: str, voice: str):
 
 
 def text_to_wav16k(text: str, voice: str = TTS_VOICE) -> str:
-    """edge_tts → MP3 → 16kHz 单声道 WAV，返回 WAV 路径（调用者负责删除）。"""
+    """TTS → 16kHz 单声道 WAV。
+
+    voice 以 CLONED: 开头时走 VoxCPM 声音克隆，否则走 edge-tts。
+    """
+    if voice.startswith(CLONED_VOICE_PREFIX):
+        ref_wav = voice[len(CLONED_VOICE_PREFIX):]
+        return voxcpm_synthesize(text, ref_wav)
+
     fd_mp3, mp3_path = tempfile.mkstemp(suffix=".mp3", prefix="cv_tts_")
     os.close(fd_mp3)
     wav_path = tempfile.mktemp(suffix=".wav", prefix="cv_tts_")
@@ -362,8 +501,70 @@ def synthesize_video(wav_path: str) -> str:
     return mp4_path
 
 
+# ─── 字幕：WAV → SRT → 烧录进 MP4 ──────────────────────────────────────────
+def _fmt_srt_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _wav_to_srt(wav_path: str, srt_path: str, offset: float = 0.0):
+    """用 faster-whisper 对 WAV 识别，生成 SRT 文件。offset 用于拼接多段时间偏移。"""
+    model = _load_whisper()
+    segments, _ = model.transcribe(
+        wav_path, language="zh", beam_size=5, word_timestamps=False, vad_filter=True,
+    )
+    lines = []
+    idx = 1
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        lines.append(str(idx))
+        lines.append(
+            f"{_fmt_srt_time(seg.start + offset)} --> {_fmt_srt_time(seg.end + offset)}"
+        )
+        lines.append(text)
+        lines.append("")
+        idx += 1
+    Path(srt_path).write_text("\n".join(lines), encoding="utf-8")
+    logger.info("SRT 生成: %s (%d 条字幕)", srt_path, idx - 1)
+    return idx - 1  # 返回字幕条数
+
+
+def _burn_subtitles(mp4_path: str, srt_path: str) -> str:
+    """ffmpeg subtitles filter 将 SRT 字幕烧录进视频，返回新 MP4 路径。"""
+    fd, out_path = tempfile.mkstemp(suffix=".mp4", prefix="cv_sub_", dir="/tmp")
+    os.close(fd)
+    # ffmpeg subtitles filter 需要转义冒号
+    safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
+    style = (
+        "FontName=SimHei,FontSize=22,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2"
+    )
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", mp4_path,
+        "-vf", f"subtitles={safe_srt}:force_style='{style}'",
+        "-c:a", "copy",
+        out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "字幕烧录失败: " + r.stderr.decode("utf-8", errors="replace").strip()
+        )
+    try:
+        os.unlink(mp4_path)
+    except OSError:
+        pass
+    return out_path
+
+
 # ─── 直接播报：分批处理长文本 ────────────────────────────────────────────────
-def synthesize_video_direct(text: str, voice: str = TTS_VOICE) -> str:
+def synthesize_video_direct(text: str, voice: str = TTS_VOICE, subtitle: bool = False) -> str:
     """长文本直接播报：分句分批 TTS+FlashHead，合并成一个 MP4。
 
     每批 ~3 句（≤450 字），避免单次 FlashHead 推理音频过长导致 OOM 或超时。
@@ -376,6 +577,7 @@ def synthesize_video_direct(text: str, voice: str = TTS_VOICE) -> str:
     all_frames: list[np.ndarray] = []
     all_pcm = b""
     fps_final = 20
+    batch_wav_paths: list[str] = []   # 保留用于字幕生成
 
     for idx, batch in enumerate(batches):
         chunk_text = "".join(batch)
@@ -387,11 +589,15 @@ def synthesize_video_direct(text: str, voice: str = TTS_VOICE) -> str:
             fps_final = fps
             with wave.open(wav_path, "rb") as wf:
                 all_pcm += wf.readframes(wf.getnframes())
+            if subtitle:
+                batch_wav_paths.append(wav_path)
+                wav_path = None  # 不在 finally 里删
         finally:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+            if wav_path:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
 
     if not all_frames:
         raise RuntimeError("直接播报：未产生任何视频帧")
@@ -422,6 +628,49 @@ def synthesize_video_direct(text: str, voice: str = TTS_VOICE) -> str:
             pass
 
     logger.info("直播视频生成: %s (%d 帧, %dfps)", mp4_path, t, fps_final)
+
+    # 字幕：把每批 WAV 逐段识别，拼成带偏移的完整 SRT
+    if subtitle and batch_wav_paths:
+        fd_srt, srt_path = tempfile.mkstemp(suffix=".srt", prefix="cv_sub_")
+        os.close(fd_srt)
+        try:
+            offset = 0.0
+            all_lines: list[str] = []
+            sub_idx = 1
+            for bwav in batch_wav_paths:
+                try:
+                    model = _load_whisper()
+                    segs, _ = model.transcribe(
+                        bwav, language="zh", beam_size=5, word_timestamps=False, vad_filter=True,
+                    )
+                    with wave.open(bwav, "rb") as wf:
+                        duration = wf.getnframes() / wf.getframerate()
+                    for seg in segs:
+                        txt = seg.text.strip()
+                        if txt:
+                            all_lines.append(str(sub_idx))
+                            all_lines.append(
+                                f"{_fmt_srt_time(seg.start + offset)} --> "
+                                f"{_fmt_srt_time(seg.end + offset)}"
+                            )
+                            all_lines.append(txt)
+                            all_lines.append("")
+                            sub_idx += 1
+                    offset += duration
+                finally:
+                    try:
+                        os.unlink(bwav)
+                    except OSError:
+                        pass
+            Path(srt_path).write_text("\n".join(all_lines), encoding="utf-8")
+            logger.info("直播字幕: %d 条", sub_idx - 1)
+            mp4_path = _burn_subtitles(mp4_path, srt_path)
+        finally:
+            try:
+                os.unlink(srt_path)
+            except OSError:
+                pass
+
     return mp4_path
 
 
@@ -434,6 +683,7 @@ def process(
     system_prompt: str,
     tts_voice: str,
     direct_mode: bool = False,  # True → 跳过 LLM，直接朗读输入文字
+    subtitle: bool = False,     # True → 字幕烧录进视频
 ) -> tuple[list, str | None, str]:
     """完整管道：(audio|text) → [LLM] → TTS → FlashHead → MP4"""
     status = ""
@@ -489,13 +739,25 @@ def process(
         status = "🎬 生成数字人视频…"
         if direct_mode:
             # 长文本分批处理，每批 ~3 句，避免单次推理超时
-            mp4_path = synthesize_video_direct(ai_text, voice=tts_voice)
+            mp4_path = synthesize_video_direct(ai_text, voice=tts_voice, subtitle=subtitle)
         else:
             status = "🔊 合成语音…"
             wav_path = text_to_wav16k(ai_text, voice=tts_voice)
             try:
                 status = "🎬 生成数字人视频…"
                 mp4_path = synthesize_video(wav_path)
+                if subtitle:
+                    status = "📝 生成字幕…"
+                    fd_srt, srt_path = tempfile.mkstemp(suffix=".srt", prefix="cv_sub_")
+                    os.close(fd_srt)
+                    try:
+                        _wav_to_srt(wav_path, srt_path)
+                        mp4_path = _burn_subtitles(mp4_path, srt_path)
+                    finally:
+                        try:
+                            os.unlink(srt_path)
+                        except OSError:
+                            pass
             finally:
                 try:
                     os.unlink(wav_path)
@@ -528,12 +790,21 @@ def build_ui():
                     )
                 with gr.Row():
                     text_in = gr.Textbox(
-                        placeholder="或者直接输入文字…",
+                        placeholder="直接输入文字，或从下方 URL 提取摘要…",
                         label="文字输入",
-                        lines=2,
+                        lines=3,
                     )
                 with gr.Row():
+                    url_in = gr.Textbox(
+                        placeholder="粘贴公众号 / 网页 URL，点「提取摘要」自动填入上方",
+                        label="文章 URL",
+                        lines=1,
+                        scale=4,
+                    )
+                    url_btn = gr.Button("提取摘要", variant="secondary", scale=1)
+                with gr.Row():
                     direct_mode = gr.Checkbox(label="直接播报（跳过AI，逐字朗读）", value=False)
+                    subtitle_chk = gr.Checkbox(label="显示字幕", value=False)
                 with gr.Row():
                     send_btn = gr.Button("发送", variant="primary", scale=2)
                     clear_btn = gr.Button("清除对话", scale=1)
@@ -541,6 +812,26 @@ def build_ui():
             with gr.Column(scale=1):
                 video_out = gr.Video(label="数字人视频", height=400, sources=[])
                 status_out = gr.Textbox(label="状态", interactive=False)
+
+        with gr.Accordion("🎙️ 声音克隆", open=False):
+            gr.Markdown(
+                "上传包含目标声音的视频或音频（支持 mp4/mov/mp3/wav 等），"
+                "提取后作为克隆参考，可在 TTS 声音下拉框中选用。\n\n"
+                "> 需要 GPU（VoxCPM2 约 8GB VRAM）。"
+            )
+            with gr.Row():
+                clone_media_in = gr.File(
+                    label="参考视频 / 音频",
+                    file_types=["video", "audio"],
+                )
+                with gr.Column():
+                    clone_name_in = gr.Textbox(
+                        label="声音名称",
+                        placeholder="例：张总",
+                        lines=1,
+                    )
+                    clone_btn = gr.Button("提取并保存参考音频", variant="secondary")
+                    clone_status = gr.Textbox(label="", interactive=False, lines=2)
 
         with gr.Accordion("⚙️ 设置", open=False):
             with gr.Row():
@@ -566,34 +857,55 @@ def build_ui():
                         label="系统提示词",
                         lines=4,
                     )
+                    _edge_tts_choices = [
+                        ("晓晓 - 女声（zh-CN）", "zh-CN-XiaoxiaoNeural"),
+                        ("云希 - 男声（zh-CN）", "zh-CN-YunxiNeural"),
+                        ("晓伊 - 女声（zh-CN）", "zh-CN-XiaoyiNeural"),
+                        ("云健 - 男声（zh-CN）", "zh-CN-YunjianNeural"),
+                        ("晓辰 - 女声（zh-CN）", "zh-CN-XiaochenNeural"),
+                        ("晓涵 - 女声（zh-CN）", "zh-CN-XiaohanNeural"),
+                        ("曉臻 - 女声（zh-TW）", "zh-TW-HsiaoChenNeural"),
+                        ("雲哲 - 男声（zh-TW）", "zh-TW-YunJheNeural"),
+                    ]
                     voice_in = gr.Dropdown(
-                        choices=[
-                            "zh-CN-XiaoxiaoNeural",
-                            "zh-CN-YunxiNeural",
-                            "zh-CN-XiaoyiNeural",
-                            "zh-TW-HsiaoChenNeural",
-                        ],
+                        choices=_edge_tts_choices + list_cloned_voices(),
                         value=TTS_VOICE,
                         label="TTS 声音",
                     )
 
         history_state = gr.State([])
 
-        def on_process(audio, text, history, avatar, sys_prompt, voice, direct):
-            new_history, video, status = process(audio, text, history, avatar, sys_prompt, voice, direct)
+        def on_process(audio, text, history, avatar, sys_prompt, voice, direct, sub):
+            new_history, video, status = process(audio, text, history, avatar, sys_prompt, voice, direct, sub)
             return new_history, new_history, video, status, None, ""
 
         send_btn.click(
             fn=on_process,
-            inputs=[audio_in, text_in, history_state, avatar_in, system_prompt_in, voice_in, direct_mode],
+            inputs=[audio_in, text_in, history_state, avatar_in, system_prompt_in, voice_in, direct_mode, subtitle_chk],
             outputs=[history_state, chatbot, video_out, status_out, audio_in, text_in],
         )
         text_in.submit(
             fn=on_process,
-            inputs=[audio_in, text_in, history_state, avatar_in, system_prompt_in, voice_in, direct_mode],
+            inputs=[audio_in, text_in, history_state, avatar_in, system_prompt_in, voice_in, direct_mode, subtitle_chk],
             outputs=[history_state, chatbot, video_out, status_out, audio_in, text_in],
         )
         clear_btn.click(lambda: ([], [], None, ""), outputs=[history_state, chatbot, video_out, status_out])
+
+        def on_fetch_url(url: str):
+            url = (url or "").strip()
+            if not url:
+                return "", "❌ 请先输入 URL"
+            try:
+                summary, status = fetch_and_summarize(url)
+                return summary, status
+            except Exception as e:
+                return "", f"❌ {e}"
+
+        url_btn.click(
+            fn=on_fetch_url,
+            inputs=[url_in],
+            outputs=[text_in, status_out],
+        )
 
         def change_avatar(avatar_path):
             if not avatar_path:
@@ -605,6 +917,45 @@ def build_ui():
                 return f"❌ {e}"
 
         avatar_btn.click(fn=change_avatar, inputs=[avatar_in], outputs=[avatar_status])
+
+        def do_clone_voice(media_file, name: str):
+            if not media_file:
+                return "❌ 请先上传视频或音频文件", gr.update()
+            name = (name or "").strip()
+            if not name:
+                return "❌ 请填写声音名称", gr.update()
+            try:
+                media_path = media_file if isinstance(media_file, str) else media_file.name
+                # 使用名称作为文件名
+                safe_name = name.replace(" ", "_").replace("/", "_")
+                out_wav = str(CLONED_VOICES_DIR / f"{safe_name}_ref.wav")
+                r = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                     "-i", media_path,
+                     "-vn", "-ar", "16000", "-ac", "1", "-t", "30",
+                     out_wav],
+                    capture_output=True,
+                )
+                if r.returncode != 0:
+                    return "❌ 提取失败: " + r.stderr.decode("utf-8", errors="replace").strip(), gr.update()
+                size_kb = os.path.getsize(out_wav) / 1024
+                if size_kb < 8:
+                    return f"❌ 提取的音频过短或为空 ({size_kb:.1f} KB)", gr.update()
+                # 刷新下拉框
+                new_choices = _edge_tts_choices + list_cloned_voices()
+                new_val = f"{CLONED_VOICE_PREFIX}{out_wav}"
+                return (
+                    f"✅ 参考音频已保存 ({size_kb:.0f} KB)\n路径: {out_wav}",
+                    gr.update(choices=new_choices, value=new_val),
+                )
+            except Exception as e:
+                return f"❌ {e}", gr.update()
+
+        clone_btn.click(
+            fn=do_clone_voice,
+            inputs=[clone_media_in, clone_name_in],
+            outputs=[clone_status, voice_in],
+        )
 
         def apply_lms_url(url: str):
             url = (url or "").strip()
